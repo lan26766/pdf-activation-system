@@ -1,281 +1,266 @@
 """
-PDF Fusion Pro - 激活码服务器
-部署到 Render.com 的完整版本
+PDF Fusion Pro - 激活服务器 (PostgreSQL)
+主服务器文件
 """
+
 import os
 import json
 import base64
 import hashlib
-import sqlite3
+import logging
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from cryptography.fernet import Fernet
-import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # 初始化Flask应用
 app = Flask(__name__)
-CORS(app)  # 允许跨域
+CORS(app)
 
-# 配置
+# 配置类
 class Config:
-    # 从环境变量读取（在Render.com面板设置）
-    SECRET_KEY = os.getenv('ENCRYPTION_KEY', 'default_secret_key_change_in_production')
-    DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///activations.db')
+    # 从环境变量读取
+    ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', '')
+    ADMIN_API_KEY = os.getenv('ADMIN_API_KEY', '')
+    DATABASE_URL = os.getenv('DATABASE_URL', '')
+    
+    # 邮件配置
     SMTP_HOST = os.getenv('SMTP_HOST', 'smtp.gmail.com')
     SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
     SMTP_USER = os.getenv('SMTP_USER', '')
     SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
-    ADMIN_API_KEY = os.getenv('ADMIN_API_KEY', 'change_this_in_production')
+    
+    # Gumroad配置
     GUMROAD_WEBHOOK_SECRET = os.getenv('GUMROAD_WEBHOOK_SECRET', '')
     
-    # 初始化加密
     @classmethod
-    def get_cipher(cls):
-        key = base64.urlsafe_b64encode(cls.SECRET_KEY.ljust(32)[:32].encode())
-        return Fernet(key)
+    def validate(cls):
+        """验证配置"""
+        required = ['ENCRYPTION_KEY', 'ADMIN_API_KEY', 'DATABASE_URL']
+        missing = [var for var in required if not getattr(cls, var)]
+        
+        if missing:
+            raise ValueError(f"缺少环境变量: {', '.join(missing)}")
+        
+        logger.info("✅ 配置验证通过")
 
+# 初始化配置
 config = Config()
-cipher = config.get_cipher()
 
-# 数据库连接
-def get_db_connection():
-    if config.DATABASE_URL.startswith('sqlite'):
-        conn = sqlite3.connect('activations.db')
-        conn.row_factory = sqlite3.Row
-    else:
-        # PostgreSQL连接（Render.com默认）
-        import psycopg2
-        import urllib.parse as urlparse
-        url = urlparse.urlparse(config.DATABASE_URL)
-        conn = psycopg2.connect(
-            database=url.path[1:],
-            user=url.username,
-            password=url.password,
-            host=url.hostname,
-            port=url.port
+# 初始化加密
+def init_encryption():
+    """初始化加密工具"""
+    try:
+        key = base64.urlsafe_b64encode(
+            config.ENCRYPTION_KEY.ljust(32)[:32].encode()
         )
-    return conn
+        return Fernet(key)
+    except Exception as e:
+        logger.error(f"加密初始化失败: {e}")
+        raise
 
-def init_database():
-    """初始化数据库表"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 激活码表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS activations (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        activation_code TEXT NOT NULL UNIQUE,
-        product_type VARCHAR(50) DEFAULT 'personal',
-        days_valid INTEGER DEFAULT 365,
-        max_devices INTEGER DEFAULT 3,
-        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        valid_until TIMESTAMP,
-        is_used BOOLEAN DEFAULT FALSE,
-        used_at TIMESTAMP,
-        used_by_device TEXT,
-        purchase_id TEXT,
-        order_id TEXT,
-        metadata JSONB
-    )
-    ''')
-    
-    # 设备激活记录表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS device_activations (
-        id SERIAL PRIMARY KEY,
-        activation_id INTEGER REFERENCES activations(id),
-        device_id TEXT NOT NULL,
-        device_name TEXT,
-        activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_used TIMESTAMP,
-        is_active BOOLEAN DEFAULT TRUE
-    )
-    ''')
-    
-    # Gumroad购买记录表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS purchases (
-        id SERIAL PRIMARY KEY,
-        purchase_id TEXT UNIQUE NOT NULL,
-        email VARCHAR(255) NOT NULL,
-        product_name TEXT,
-        price DECIMAL(10,2),
-        currency VARCHAR(10),
-        purchased_at TIMESTAMP,
-        gumroad_data JSONB,
-        processed BOOLEAN DEFAULT FALSE,
-        processed_at TIMESTAMP
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
+# 初始化数据库连接
+def get_db_connection():
+    """获取数据库连接"""
+    try:
+        conn = psycopg2.connect(config.DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"数据库连接失败: {e}")
+        raise
 
-# API密钥验证装饰器
+# 初始化
+try:
+    config.validate()
+    cipher = init_encryption()
+    logger.info("✅ 系统初始化完成")
+except Exception as e:
+    logger.error(f"❌ 初始化失败: {e}")
+    raise
+
+# ==================== 工具函数 ====================
+
 def require_api_key(f):
+    """API密钥验证装饰器"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         api_key = request.headers.get('X-API-Key')
         if not api_key or api_key != config.ADMIN_API_KEY:
-            return jsonify({"error": "Unauthorized"}), 401
+            return jsonify({"error": "未授权"}), 401
         return f(*args, **kwargs)
     return decorated_function
 
-# Gumroad Webhook验证
-def verify_gumroad_signature(request):
-    """验证Gumroad Webhook签名"""
-    if not config.GUMROAD_WEBHOOK_SECRET:
-        return True  # 如果没有设置密钥，跳过验证
+def generate_activation_code(email, product_type="personal", days=365, purchase_data=None):
+    """生成激活码"""
+    activation_data = {
+        "email": email,
+        "product_type": product_type,
+        "days_valid": days,
+        "generated_at": datetime.now().isoformat(),
+        "valid_until": (datetime.now() + timedelta(days=days)).isoformat(),
+        "max_devices": 3 if product_type == "personal" else 10,
+        "purchase_id": purchase_data.get('id') if purchase_data else ''
+    }
     
-    signature = request.headers.get('X-Gumroad-Signature')
-    if not signature:
-        return False
+    # 加密
+    data_str = json.dumps(activation_data, separators=(',', ':'))
+    encrypted = cipher.encrypt(data_str.encode())
+    activation_code = base64.urlsafe_b64encode(encrypted).decode()
     
-    # 验证签名逻辑（根据Gumroad文档）
-    import hmac
-    import hashlib
+    # 格式化
+    formatted_code = '-'.join([
+        activation_code[i:i+8] 
+        for i in range(0, len(activation_code), 8)
+    ])[:59]
     
-    payload = request.get_data()
-    expected_signature = hmac.new(
-        config.GUMROAD_WEBHOOK_SECRET.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(signature, expected_signature)
+    return formatted_code, activation_data
 
-# 激活码生成
-class ActivationGenerator:
-    @staticmethod
-    def generate_code(email, product_type="personal", days=365, purchase_data=None):
-        """生成加密的激活码"""
-        
-        # 激活数据
-        activation_data = {
-            "email": email,
-            "product_type": product_type,
-            "days_valid": days,
-            "generated_at": datetime.now().isoformat(),
-            "valid_until": (datetime.now() + timedelta(days=days)).isoformat(),
-            "max_devices": 3 if product_type == "personal" else 10,
-            "purchase_id": purchase_data.get('id') if purchase_data else '',
-            "seller_id": purchase_data.get('seller_id') if purchase_data else ''
-        }
-        
-        # 加密
-        data_str = json.dumps(activation_data, separators=(',', ':'))
-        encrypted = cipher.encrypt(data_str.encode())
-        activation_code = base64.urlsafe_b64encode(encrypted).decode()
-        
-        # 格式化为易读格式
-        formatted_code = '-'.join([
-            activation_code[i:i+8] 
-            for i in range(0, len(activation_code), 8)
-        ])[:59]  # 限制长度
-        
-        return formatted_code, activation_data
-    
-    @staticmethod
-    def save_to_database(email, activation_code, activation_data):
-        """保存到数据库"""
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
+def save_activation_to_db(email, activation_code, activation_data):
+    """保存激活码到数据库"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
             cursor.execute('''
             INSERT INTO activations 
-            (email, activation_code, product_type, days_valid, valid_until, max_devices, purchase_id, metadata)
+            (email, activation_code, product_type, days_valid, max_devices, valid_until, metadata, purchase_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             ''', (
                 email,
                 activation_code,
                 activation_data['product_type'],
                 activation_data['days_valid'],
-                activation_data['valid_until'],
                 activation_data['max_devices'],
-                activation_data.get('purchase_id'),
-                json.dumps(activation_data)
+                activation_data['valid_until'],
+                json.dumps(activation_data),
+                activation_data.get('purchase_id')
             ))
             
+            activation_id = cursor.fetchone()[0]
             conn.commit()
-            activation_id = cursor.lastrowid
             return activation_id
             
-        except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            conn.close()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        # 如果已存在，返回现有ID
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'SELECT id FROM activations WHERE activation_code = %s',
+                (activation_code,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
-# 邮件发送
-class EmailSender:
-    @staticmethod
-    def send_activation_email(email, activation_code, activation_data):
-        """发送激活邮件"""
+def verify_activation_code(activation_code):
+    """验证激活码"""
+    try:
+        # 清理格式
+        code_clean = activation_code.replace('-', '').replace(' ', '')
         
-        # 如果未配置SMTP，记录到日志
-        if not config.SMTP_USER or not config.SMTP_PASSWORD:
-            print(f"[模拟发送] 激活邮件到 {email}: {activation_code}")
-            return True
+        # 解码
+        encrypted = base64.urlsafe_b64decode(code_clean + '=' * (4 - len(code_clean) % 4))
+        decrypted = cipher.decrypt(encrypted).decode()
+        activation_data = json.loads(decrypted)
         
-        # 邮件内容
-        subject = f"🎉 您的 PDF Fusion Pro 激活码 - {activation_data['product_type'].capitalize()} 版"
+        # 检查有效期
+        valid_until = datetime.fromisoformat(activation_data['valid_until'])
+        if datetime.now() > valid_until:
+            return False, "激活码已过期", None
         
-        # 读取HTML模板
-        try:
-            with open('templates/activation_email.html', 'r', encoding='utf-8') as f:
-                html_template = f.read()
-        except:
-            html_template = '''
-            <html>
-            <body>
-                <h1>您的 PDF Fusion Pro 激活码</h1>
-                <p>激活码: <strong>{activation_code}</strong></p>
-                <p>有效期至: {valid_until}</p>
-                <p>感谢您的购买！</p>
-            </body>
-            </html>
-            '''
+        # 计算剩余天数
+        days_remaining = (valid_until - datetime.now()).days
+        activation_data['days_remaining'] = days_remaining
         
-        # 填充模板
-        html_content = html_template.format(
-            activation_code=activation_code,
-            email=email,
-            product_type=activation_data['product_type'].capitalize(),
-            valid_until=activation_data['valid_until'][:10],
-            max_devices=activation_data['max_devices'],
-            current_year=datetime.now().year
-        )
+        return True, "激活码有效", activation_data
         
-        # 发送邮件
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
+    except Exception as e:
+        return False, f"激活码无效: {str(e)}", None
+
+def register_device(activation_code, device_id, device_name):
+    """注册设备激活"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 获取激活信息
+            cursor.execute('''
+            SELECT id, max_devices, is_used 
+            FROM activations 
+            WHERE activation_code = %s
+            FOR UPDATE
+            ''', (activation_code,))
             
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = config.SMTP_USER
-            msg['To'] = email
+            activation = cursor.fetchone()
+            if not activation:
+                return False, "激活码不存在"
             
-            msg.attach(MIMEText(html_content, 'html'))
+            activation_id, max_devices, is_used = activation
             
-            with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT) as server:
-                server.starttls()
-                server.login(config.SMTP_USER, config.SMTP_PASSWORD)
-                server.send_message(msg)
+            # 检查是否已激活此设备
+            cursor.execute('''
+            SELECT id FROM device_activations 
+            WHERE activation_id = %s AND device_id = %s AND is_active = TRUE
+            ''', (activation_id, device_id))
             
-            print(f"✅ 激活邮件已发送到 {email}")
-            return True
+            existing_device = cursor.fetchone()
+            if existing_device:
+                # 更新最后使用时间
+                cursor.execute('''
+                UPDATE device_activations 
+                SET last_used = CURRENT_TIMESTAMP 
+                WHERE id = %s
+                ''', (existing_device[0],))
+                conn.commit()
+                return True, "设备已激活"
             
-        except Exception as e:
-            print(f"❌ 发送邮件失败: {e}")
-            return False
+            # 检查设备数量
+            cursor.execute('''
+            SELECT COUNT(*) FROM device_activations 
+            WHERE activation_id = %s AND is_active = TRUE
+            ''', (activation_id,))
+            
+            device_count = cursor.fetchone()[0]
+            if device_count >= max_devices:
+                return False, f"已达到最大设备数 ({max_devices}台)"
+            
+            # 注册新设备
+            cursor.execute('''
+            INSERT INTO device_activations 
+            (activation_id, device_id, device_name)
+            VALUES (%s, %s, %s)
+            ''', (activation_id, device_id, device_name))
+            
+            # 更新激活码状态
+            if not is_used:
+                cursor.execute('''
+                UPDATE activations 
+                SET is_used = TRUE, used_at = CURRENT_TIMESTAMP, used_by_device = %s
+                WHERE id = %s
+                ''', (device_id, activation_id))
+            
+            conn.commit()
+            return True, "设备注册成功"
+            
+    except Exception as e:
+        conn.rollback()
+        return False, f"注册失败: {str(e)}"
+    finally:
+        conn.close()
 
 # ==================== API 路由 ====================
 
@@ -283,27 +268,39 @@ class EmailSender:
 def home():
     """主页"""
     return jsonify({
-        "service": "PDF Fusion Pro Activation Server",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "health": "/health",
-            "generate": "/api/generate (POST)",
-            "verify": "/api/verify (POST)",
-            "webhook": "/api/webhook/gumroad (POST)",
-            "admin": "/api/admin/*"
-        }
+        "service": "PDF Fusion Pro 激活服务器",
+        "version": "2.0.0",
+        "status": "运行中",
+        "database": "PostgreSQL",
+        "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/health')
 def health_check():
     """健康检查"""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            result = cursor.fetchone()
+        conn.close()
+        
+        return jsonify({
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
 @app.route('/api/generate', methods=['POST'])
 @require_api_key
-def generate_activation():
-    """手动生成激活码（管理员用）"""
+def api_generate():
+    """生成激活码"""
     try:
         data = request.json
         email = data.get('email')
@@ -311,34 +308,32 @@ def generate_activation():
         days = data.get('days', 365)
         
         if not email:
-            return jsonify({"error": "Email is required"}), 400
+            return jsonify({"error": "邮箱地址是必需的"}), 400
         
         # 生成激活码
-        code, activation_data = ActivationGenerator.generate_code(
+        activation_code, activation_data = generate_activation_code(
             email, product_type, days
         )
         
         # 保存到数据库
-        activation_id = ActivationGenerator.save_to_database(
-            email, code, activation_data
-        )
+        activation_id = save_activation_to_db(email, activation_code, activation_data)
         
-        # 发送邮件
-        EmailSender.send_activation_email(email, code, activation_data)
+        logger.info(f"✅ 激活码生成: {email} -> {activation_code[:20]}...")
         
         return jsonify({
             "success": True,
             "activation_id": activation_id,
-            "activation_code": code,
+            "activation_code": activation_code,
             "data": activation_data
         })
         
     except Exception as e:
+        logger.error(f"生成激活码失败: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/verify', methods=['POST'])
-def verify_activation():
-    """验证激活码（客户端调用）"""
+def api_verify():
+    """验证激活码"""
     try:
         data = request.json
         activation_code = data.get('activation_code')
@@ -346,161 +341,93 @@ def verify_activation():
         device_name = data.get('device_name', 'Unknown Device')
         
         if not activation_code:
-            return jsonify({"error": "Activation code is required"}), 400
+            return jsonify({"error": "激活码是必需的"}), 400
         
-        # 清理激活码
-        code_clean = activation_code.replace('-', '').replace(' ', '')
+        if not device_id:
+            return jsonify({"error": "设备ID是必需的"}), 400
         
-        try:
-            # 解码和解密
-            encrypted = base64.urlsafe_b64decode(code_clean + '=' * (4 - len(code_clean) % 4))
-            decrypted = cipher.decrypt(encrypted).decode()
-            activation_data = json.loads(decrypted)
-            
-            # 检查有效期
-            valid_until = datetime.fromisoformat(activation_data['valid_until'])
-            if datetime.now() > valid_until:
-                return jsonify({
-                    "valid": False,
-                    "message": "激活码已过期"
-                })
-            
-            # 查询数据库
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                'SELECT * FROM activations WHERE activation_code = %s',
-                (activation_code,)
-            )
-            db_record = cursor.fetchone()
-            
-            if not db_record:
-                # 如果数据库中没有记录，可能是旧版本生成的，仍然允许
-                print(f"⚠️ 激活码不在数据库中: {activation_code}")
-            else:
-                if db_record['is_used']:
-                    # 检查是否当前设备
-                    cursor.execute('''
-                    SELECT * FROM device_activations 
-                    WHERE activation_id = %s AND device_id = %s AND is_active = TRUE
-                    ''', (db_record['id'], device_id))
-                    
-                    device_record = cursor.fetchone()
-                    
-                    if not device_record:
-                        # 不是当前设备，检查设备数量
-                        cursor.execute('''
-                        SELECT COUNT(*) as device_count FROM device_activations 
-                        WHERE activation_id = %s AND is_active = TRUE
-                        ''', (db_record['id'],))
-                        
-                        device_count = cursor.fetchone()['device_count']
-                        
-                        if device_count >= db_record['max_devices']:
-                            return jsonify({
-                                "valid": False,
-                                "message": f"已达到最大设备数 ({db_record['max_devices']}台)"
-                            })
-            
-            # 记录设备激活
-            if device_id and db_record:
-                cursor.execute('''
-                INSERT INTO device_activations (activation_id, device_id, device_name)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (activation_id, device_id) 
-                DO UPDATE SET last_used = CURRENT_TIMESTAMP, is_active = TRUE
-                ''', (db_record['id'], device_id, device_name))
-                
-                # 更新激活码为已使用
-                cursor.execute('''
-                UPDATE activations 
-                SET is_used = TRUE, used_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                ''', (db_record['id'],))
-                
-                conn.commit()
-            
-            conn.close()
-            
-            return jsonify({
-                "valid": True,
-                "message": "激活码有效",
-                "data": {
-                    "email": activation_data['email'],
-                    "product_type": activation_data['product_type'],
-                    "valid_until": activation_data['valid_until'],
-                    "max_devices": activation_data['max_devices'],
-                    "days_remaining": (valid_until - datetime.now()).days
-                }
-            })
-            
-        except Exception as e:
-            return jsonify({
-                "valid": False,
-                "message": f"激活码无效: {str(e)}"
-            })
-            
+        # 验证激活码
+        is_valid, message, activation_data = verify_activation_code(activation_code)
+        if not is_valid:
+            return jsonify({"valid": False, "message": message})
+        
+        # 注册设备
+        registered, reg_message = register_device(activation_code, device_id, device_name)
+        if not registered:
+            return jsonify({"valid": False, "message": reg_message})
+        
+        logger.info(f"✅ 激活码验证: {activation_code[:20]}... -> {device_id}")
+        
+        return jsonify({
+            "valid": True,
+            "message": "激活成功",
+            "data": {
+                "email": activation_data['email'],
+                "product_type": activation_data['product_type'],
+                "valid_until": activation_data['valid_until'],
+                "max_devices": activation_data['max_devices'],
+                "days_remaining": activation_data['days_remaining'],
+                "device_id": device_id
+            }
+        })
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"验证激活码失败: {e}")
+        return jsonify({"error": "服务器内部错误"}), 500
 
 @app.route('/api/webhook/gumroad', methods=['POST'])
-def gumroad_webhook():
-    """Gumroad Webhook 接收器"""
+def webhook_gumroad():
+    """Gumroad Webhook"""
     try:
-        # 验证签名
-        if not verify_gumroad_signature(request):
-            return jsonify({"error": "Invalid signature"}), 401
-        
         data = request.json
+        
+        # 验证Webhook签名（可选）
+        if config.GUMROAD_WEBHOOK_SECRET:
+            signature = request.headers.get('X-Gumroad-Signature')
+            if not signature:
+                return jsonify({"error": "缺少签名"}), 401
         
         # 记录购买
         conn = get_db_connection()
-        cursor = conn.cursor()
-        
         try:
-            cursor.execute('''
-            INSERT INTO purchases (purchase_id, email, product_name, price, currency, purchased_at, gumroad_data)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (purchase_id) DO NOTHING
-            ''', (
-                data.get('id'),
-                data.get('email'),
-                data.get('product_name'),
-                data.get('price') / 100 if data.get('price') else 0,
-                data.get('currency'),
-                data.get('created_at'),
-                json.dumps(data)
-            ))
-            
-            conn.commit()
-            purchase_id = cursor.lastrowid
-            
-        except Exception as e:
-            conn.rollback()
-            print(f"❌ 保存购买记录失败: {e}")
-            return jsonify({"error": str(e)}), 500
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                INSERT INTO purchases 
+                (purchase_id, email, product_name, price, currency, purchased_at, gumroad_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (purchase_id) DO UPDATE SET
+                email = EXCLUDED.email,
+                product_name = EXCLUDED.product_name,
+                price = EXCLUDED.price,
+                gumroad_data = EXCLUDED.gumroad_data
+                ''', (
+                    data.get('id'),
+                    data.get('email'),
+                    data.get('product_name'),
+                    float(data.get('price', 0)) / 100,
+                    data.get('currency'),
+                    data.get('created_at'),
+                    json.dumps(data)
+                ))
+                conn.commit()
         finally:
             conn.close()
         
-        # 根据产品名称判断产品类型
+        # 判断产品类型
         product_name = data.get('product_name', '').lower()
         product_type = 'personal'
         days_valid = 365
         
         if 'business' in product_name:
             product_type = 'business'
-            max_devices = 10
+            days_valid = 365 * 2
         elif 'enterprise' in product_name:
             product_type = 'enterprise'
-            max_devices = 999
-            days_valid = 365 * 3  # 企业版3年
-        else:
-            max_devices = 3
+            days_valid = 365 * 3
         
         # 生成激活码
         email = data.get('email')
-        activation_code, activation_data = ActivationGenerator.generate_code(
+        activation_code, activation_data = generate_activation_code(
             email=email,
             product_type=product_type,
             days=days_valid,
@@ -508,117 +435,85 @@ def gumroad_webhook():
         )
         
         # 保存到数据库
-        activation_id = ActivationGenerator.save_to_database(
-            email, activation_code, activation_data
-        )
-        
-        # 发送激活邮件
-        EmailSender.send_activation_email(email, activation_code, activation_data)
+        activation_id = save_activation_to_db(email, activation_code, activation_data)
         
         # 标记购买为已处理
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-        UPDATE purchases 
-        SET processed = TRUE, processed_at = CURRENT_TIMESTAMP
-        WHERE purchase_id = %s
-        ''', (data.get('id'),))
-        conn.commit()
-        conn.close()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                UPDATE purchases 
+                SET processed = TRUE, processed_at = CURRENT_TIMESTAMP
+                WHERE purchase_id = %s
+                ''', (data.get('id'),))
+                conn.commit()
+        finally:
+            conn.close()
         
-        print(f"✅ 已处理购买: {email} - {activation_code}")
+        logger.info(f"✅ Gumroad Webhook: {email} -> {activation_code[:20]}...")
         
         return jsonify({
             "success": True,
-            "message": "Activation code generated and sent",
+            "message": "激活码已生成",
             "activation_code": activation_code,
             "activation_id": activation_id
         })
         
     except Exception as e:
-        print(f"❌ Webhook处理失败: {e}")
+        logger.error(f"Webhook处理失败: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/admin/stats', methods=['GET'])
 @require_api_key
 def admin_stats():
-    """管理员统计信息"""
+    """管理统计"""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 获取统计信息
-    cursor.execute('SELECT COUNT(*) as total FROM activations')
-    total_activations = cursor.fetchone()['total']
-    
-    cursor.execute('SELECT COUNT(*) as used FROM activations WHERE is_used = TRUE')
-    used_activations = cursor.fetchone()['used']
-    
-    cursor.execute('SELECT COUNT(*) as purchases FROM purchases')
-    total_purchases = cursor.fetchone()['purchases']
-    
-    cursor.execute('SELECT COUNT(*) as processed FROM purchases WHERE processed = TRUE')
-    processed_purchases = cursor.fetchone()['processed']
-    
-    # 最近激活
-    cursor.execute('''
-    SELECT email, product_type, generated_at 
-    FROM activations 
-    ORDER BY generated_at DESC 
-    LIMIT 10
-    ''')
-    recent_activations = cursor.fetchall()
-    
-    conn.close()
-    
-    return jsonify({
-        "total_activations": total_activations,
-        "used_activations": used_activations,
-        "unused_activations": total_activations - used_activations,
-        "total_purchases": total_purchases,
-        "processed_purchases": processed_purchases,
-        "recent_activations": [
-            dict(row) for row in recent_activations
-        ]
-    })
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute('SELECT COUNT(*) as total FROM activations')
+            total = cursor.fetchone()['total']
+            
+            cursor.execute('SELECT COUNT(*) as used FROM activations WHERE is_used = TRUE')
+            used = cursor.fetchone()['used']
+            
+            cursor.execute('SELECT COUNT(*) as purchases FROM purchases')
+            purchases = cursor.fetchone()['purchases']
+            
+            # 今日激活
+            today = datetime.now().strftime('%Y-%m-%d')
+            cursor.execute('''
+            SELECT COUNT(*) as today FROM activations 
+            WHERE DATE(generated_at) = %s
+            ''', (today,))
+            today_count = cursor.fetchone()['today']
+            
+            return jsonify({
+                "total_activations": total,
+                "used_activations": used,
+                "unused_activations": total - used,
+                "total_purchases": purchases,
+                "today_activations": today_count,
+                "timestamp": datetime.now().isoformat()
+            })
+    finally:
+        conn.close()
 
-@app.route('/api/admin/activations', methods=['GET'])
-@require_api_key
-def admin_list_activations():
-    """列出所有激活码"""
-    page = int(request.args.get('page', 1))
-    limit = int(request.args.get('limit', 50))
-    offset = (page - 1) * limit
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    SELECT a.*, COUNT(d.id) as device_count
-    FROM activations a
-    LEFT JOIN device_activations d ON a.id = d.activation_id AND d.is_active = TRUE
-    GROUP BY a.id
-    ORDER BY a.generated_at DESC
-    LIMIT %s OFFSET %s
-    ''', (limit, offset))
-    
-    activations = [dict(row) for row in cursor.fetchall()]
-    
-    cursor.execute('SELECT COUNT(*) as total FROM activations')
-    total = cursor.fetchone()['total']
-    
-    conn.close()
-    
-    return jsonify({
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "total_pages": (total + limit - 1) // limit,
-        "activations": activations
-    })
+# ==================== 初始化数据库 ====================
 
-# 初始化数据库
+def init_database():
+    """初始化数据库表"""
+    from database.init_db import init_database as db_init
+    db_init(config.DATABASE_URL)
+
+# 启动时初始化数据库
 init_database()
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=os.getenv('DEBUG', 'False') == 'True')
+    debug = os.getenv('DEBUG', 'false').lower() == 'true'
+    
+    logger.info(f"🚀 启动PDF Fusion Pro激活服务器")
+    logger.info(f"🔗 数据库: PostgreSQL")
+    logger.info(f"🔐 加密: 已启用")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
