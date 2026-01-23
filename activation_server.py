@@ -969,7 +969,7 @@ def verify_from_database(activation_code, device_id, device_name):
         import psycopg2.extras
         
         # 清理激活码格式
-        activation_code = activation_code.replace('-', '').replace(' ', '')
+        activation_code = activation_code.replace('-', '').replace(' ', '').lower()
         
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1081,7 +1081,7 @@ def verify_from_file(activation_code, device_id, device_name):
             return False, "无法读取激活码数据库", {}
         
         # 清理激活码格式
-        activation_code_clean = activation_code.replace('-', '').replace(' ', '')
+        activation_code_clean = activation_code.replace('-', '').replace(' ', '').lower()
         logger.info(f"验证激活码 (清理后): {activation_code_clean}")
         
         import csv
@@ -1118,7 +1118,7 @@ def verify_from_file(activation_code, device_id, device_name):
                         
                         # 清理文件中激活码的格式
                         row_code = row.get('激活码', '')
-                        row_code_clean = row_code.replace('-', '').replace(' ', '')
+                        row_code_clean = row_code.replace('-', '').replace(' ', '').lower()
                         
                         logger.info(f"文件中激活码 (清理后): {row_code_clean}")
                         logger.info(f"比较结果: {row_code_clean} == {activation_code_clean} → {row_code_clean == activation_code_clean}")
